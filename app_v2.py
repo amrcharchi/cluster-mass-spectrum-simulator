@@ -1,7 +1,10 @@
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+from collections import Counter
 import periodictable as pt
+from spectrum_visualization_v2 import render_spectrum_visualization
+
 
 from spectrum_model_v2 import (
     generate_clusters_general,
@@ -25,6 +28,61 @@ st.set_page_config(
     page_title="Cluster Mass Spectrum Simulator",
     layout="wide"
 )
+
+
+
+def group_overlap_regions(matches):
+
+    sorted_matches = sorted(
+        matches,
+        key=lambda match: min(match[2], match[3])
+    )
+
+    regions = []
+
+    for match in sorted_matches:
+
+        mass1 = match[2]
+        mass2 = match[3]
+
+        start = min(mass1, mass2)
+        end = max(mass1, mass2)
+
+        if not regions or start > regions[-1]["end"]:
+
+            regions.append({
+                "start": start,
+                "end": end,
+                "matches": [match]
+            })
+
+        else:
+
+            regions[-1]["end"] = max(
+                regions[-1]["end"], end
+            )
+
+            regions[-1]["matches"].append(match)
+
+    return regions
+
+
+def isotopologue_label(isotopes):
+
+    counts = Counter(isotopes)
+    parts = []
+
+    for (element, mass_number), number in sorted(counts.items()):
+
+        label = f"{mass_number}{element}"
+
+        if number > 1:
+            label += f"×{number}"
+
+        parts.append(label)
+
+    return " · ".join(parts)
+
 
 st.title("Cluster Mass Spectrum Simulator")
 
@@ -363,37 +421,31 @@ overlap_rows = []
 
 for (cluster1, cluster2), matches in overlaps.items():
 
-    mass_regions = []
-
-    for iso1, iso2, mass1, mass2, difference in matches:
-
-        mass_regions.append(
-            f"{min(mass1, mass2):.4f}–"
-            f"{max(mass1, mass2):.4f}"
-        )
+    regions = group_overlap_regions(matches)
 
     overlap_rows.append({
         "Cluster 1": cluster_name(cluster1, elements),
         "Cluster 2": cluster_name(cluster2, elements),
-        "Peak pairs": len(matches),
+        "Peak-pair matches": len(matches),
+        "Overlap regions": len(regions),
         "Minimum Δm (Th)": round(
             min(match[4] for match in matches), 6
-        ),
-        "Mass intervals (Th)": ", ".join(mass_regions)
+        )
     })
+
 
 st.write("Number of overlapping cluster pairs:", len(overlaps))
 
+
 if overlap_rows:
-    # Show a maximum of 6 rows before scrolling
+
+    # Show up to six table rows before scrolling
     row_height = 35
     visible_rows = min(len(overlap_rows), 6)
     table_height = 40 + visible_rows * row_height
 
-    # Match each table row to its original cluster pair
     overlap_pairs = list(overlaps.keys())
 
-    # Refresh the table selection when the simulation changes
     table_key = (
         f"overlap_{elements}_{max_counts}_"
         f"{selected_isotopes}_{tolerance}"
@@ -415,21 +467,92 @@ if overlap_rows:
     if selected_rows:
 
         row_index = selected_rows[0]
+        selected_pair = overlap_pairs[row_index]
+
+        # Preserve the existing click-to-plot behavior
         selection_id = (table_key, row_index)
 
         if st.session_state.get("last_overlap_selection") != selection_id:
 
-            # Select the two clusters for the graph
-            st.session_state.plot_clusters = list(
-                overlap_pairs[row_index]
+            st.session_state.plot_clusters = list(selected_pair)
+            st.session_state.last_overlap_selection = selection_id
+
+        cluster1, cluster2 = selected_pair
+
+        # Group the matches belonging to this pair
+        regions = group_overlap_regions(
+            overlaps[selected_pair]
+        )
+
+        with st.expander("Isotopologue details"):
+
+            region_index = st.selectbox(
+                "Choose a mass region:",
+                options=list(range(len(regions))),
+                format_func=lambda i: (
+                    f"Region {i + 1}: "
+                    f"{regions[i]['start']:.4f}–"
+                    f"{regions[i]['end']:.4f} Th "
+                    f"({len(regions[i]['matches'])} matches)"
+                ),
+                key=f"region_{elements}_{selected_pair}"
             )
 
-            st.session_state.last_overlap_selection = selection_id
+            region = regions[region_index]
+
+            # Obtain the probabilities of each isotopologue
+            pattern1 = isotope_pattern_general(
+                dict(zip(elements, cluster1)),
+                selected_isotopes
+            )
+
+            pattern2 = isotope_pattern_general(
+                dict(zip(elements, cluster2)),
+                selected_isotopes
+            )
+
+            detail_rows = []
+
+            for iso1, iso2, mass1, mass2, difference in region["matches"]:
+
+                prob1 = pattern1[iso1][1]
+                prob2 = pattern2[iso2][1]
+
+                detail_rows.append({
+                    "Isotopologue 1": isotopologue_label(iso1),
+                    "Isotopologue 2": isotopologue_label(iso2),
+                    "Mass 1 (Th)": round(mass1, 6),
+                    "Mass 2 (Th)": round(mass2, 6),
+                    "Δm (Th)": round(difference, 6),
+                    "P1 (%)": f"{100 * prob1:.6g}",
+                    "P2 (%)": f"{100 * prob2:.6g}"
+                })
+
+            st.dataframe(
+                detail_rows,
+                width="stretch",
+                hide_index=True,
+                row_height=35,
+                height=40 + 35 * min(len(detail_rows), 6)
+            )
+
+            st.caption(
+                "Probabilities are relative to each cluster's "
+                "selected isotope distribution. Mass regions are "
+                "grouped using nearby theoretical peak positions, "
+                "not instrumental resolution."
+            )
 
     else:
         st.session_state.last_overlap_selection = None
+        st.caption(
+            "Select a cluster pair to display its spectra "
+            "and inspect the contributing isotopologues."
+        )
+
 else:
     st.info("No nearby isotope peaks were found.")
+
 
 
 
@@ -454,112 +577,10 @@ R = st.slider(
     step=100
 )
 
-if selected_clusters:
-
-    # Calculate the mass points needed for all selected spectra
-    mass_grids = []
-
-    for cluster in selected_clusters:
-
-        composition = dict(zip(elements, cluster))
-
-        pattern = isotope_pattern_general(
-            composition,
-            selected_isotopes
-        )
-
-        for mass, probability in pattern.values():
-
-            sigma = mass / (2.355 * R)
-
-            mass_grids.append(
-                np.linspace(
-                    mass - 5 * sigma,
-                    mass + 5 * sigma,
-                    81
-                )
-            )
-
-    mass_axis = np.unique(np.concatenate(mass_grids))
-
-    # Create the figure
-    fig = go.Figure()
-
-    for cluster in selected_clusters:
-
-        spectrum = gaussian_spectrum_general(
-            cluster,
-            elements,
-            selected_isotopes,
-            mass_axis,
-            R
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=mass_axis,
-                y=spectrum,
-                mode="lines",
-                name=cluster_name(cluster, elements)
-            )
-        )
-
-    # Calculate appropriate initial axis limits
-    mass_min = float(np.min(mass_axis))
-    mass_max = float(np.max(mass_axis))
-
-    mass_span = mass_max - mass_min
-    padding = max(0.3, 0.03 * mass_span)
-
-    max_intensity = max(
-        float(np.max(trace.y))
-        for trace in fig.data
-    )
-
-    # Configure the figure
-    fig.update_layout(
-        height=680,
-        xaxis_title="m/z (Th)",
-        yaxis_title="Isotope probability density (1/Th)",
-        hovermode="closest",
-        dragmode="zoom",
-        margin=dict(l=55, r=30, t=55, b=60),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0
-        )
-    )
-
-    # Horizontal axis
-    fig.update_xaxes(
-        range=[
-            max(0, mass_min - padding),
-            mass_max + padding
-        ],
-        minallowed=0,
-        fixedrange=False
-    )
-
-    # Vertical axis
-    fig.update_yaxes(
-        range=[0, max_intensity * 1.1],
-        minallowed=0,
-        fixedrange=False
-    )
-
-    # Display the interactive spectrum
-    st.plotly_chart(
-        fig,
-        width="stretch",
-        config={
-            "scrollZoom": False,
-            "showAxisDragHandles": False,
-            "modeBarButtonsToRemove": ["pan2d"]
-        }
-    )
-
-else:
-    st.info("Select at least one cluster to display its spectrum.")
+render_spectrum_visualization(
+    selected_clusters=selected_clusters,
+    elements=elements,
+    selected_isotopes=selected_isotopes,
+    R=R,
+    cluster_name=cluster_name
+)
